@@ -6,8 +6,10 @@ turned into log ratios  y_h = ln(viewers_h / viewers_1)  for hours 2..24.  The
 comparables are weighted by how much their situation at the end of hour 1 looked like
 the target's (size of hour 1, how far hour 1 sits below the previous day's high, the
 short trend into hour 1, what kind of launch it was), and the forecast for hour h is
-a normal distribution in log space around the weighted mean of y_h whose spread is the
-weighted scatter of the analogs, widened for the small sample.
+a normal distribution in log space around the weighted mean of y_h, tilted by a damped
+regression on the size of hour 1 (a bigger first hour leaves less room to grow), whose
+spread is the weighted scatter of the analogs around that fit, widened for the small
+sample.  Comparables are first lined up on the local clock (summer/winter time).
 
 Standard library only, deterministic, no network.
 """
@@ -27,15 +29,19 @@ ZS = (-1.6449, -0.6745, 0.0, 0.6745, 1.6449)
 
 # Kernel bandwidths (natural-log units) of the similarity features.
 BW_SIZE = 1.6     # ln(hour-1 viewers)
-BW_DROP = 0.55    # ln(hour 1 / highest hour of the previous 24)
-BW_TREND = 0.45   # ln(hour 1 / mean of the 3 hours before it)
+BW_DROP = 1.2     # ln(hour 1 / highest hour of the previous 24)
+BW_TREND = 0.8    # ln(hour 1 / mean of the 3 hours before it)
 BW_SURGE = 1.5    # ln(hour 1 / best hour of days -3 and -2), capped at SURGE_CAP
 SURGE_CAP = 4.0
 CLOCK_ALIGN = 1   # 1: shift comparables by an hour across the summer/winter clock change
 CONSOLE_BONUS = 6.0  # prior weight of a console-only launch
 ROLLING_BONUS = 1.5  # prior weight of a launch whose unlock is known to be midnight local
+SLOPE_ON = 2      # tilt each hour's center by a regression: 1 on the drop, 2 on the size, 0 none
+RIDGE = 0.5       # damping of that slope
+SLOPE_MIN = -0.5  # steepest size slope allowed (log ratio per log viewer)
+REACH = 0.0       # how far past the largest analog the size may be extrapolated (log units)
 BACKGROUND = 0.03  # share of weight every usable comparable keeps regardless of distance
-SPREAD_SCALE = 0.8  # multiplies the analog scatter
+SPREAD_SCALE = 0.75  # multiplies the analog scatter
 SPREAD_FLOOR = 0.07  # least log spread of any hour
 TAIL_STRETCH = 1.1  # extra width of the 5% and 95% quantiles (fat tails)
 
@@ -183,8 +189,39 @@ def analogs(case):
             if v is not None:
                 ratios[h] = math.log(max(v, 1.0) / c1)
         if len(ratios) >= 12:
-            out.append((weight, ratios))
-    return p1, out
+            out.append((weight, ratios, c_size if SLOPE_ON == 2 else c_drop))
+    return p1, out, (t_size if SLOPE_ON == 2 else t_drop)
+
+
+def fit_hour(pts, x_target):
+    """Weighted mean of y, tilted by a ridge-damped slope on x (the drop below the previous
+    day's high): pts is [(weight, y, x)].  Returns (center, variance, effective sample)."""
+    sw = sum(w for w, _, _ in pts)
+    mean = sum(w * y for w, y, _ in pts) / sw
+    n_eff = sw * sw / sum(w * w for w, _, _ in pts)
+    slope = 0.0
+    xbar = 0.0
+    usable = [(w, y, x) for w, y, x in pts if x is not None]
+    if SLOPE_ON and x_target is not None and len(usable) >= 5:
+        swx = sum(w for w, _, _ in usable)
+        xbar = sum(w * x for w, _, x in usable) / swx
+        ybar = sum(w * y for w, y, _ in usable) / swx
+        sxx = sum(w * (x - xbar) ** 2 for w, _, x in usable) / swx
+        sxy = sum(w * (x - xbar) * (y - ybar) for w, y, x in usable) / swx
+        slope = sxy / (sxx + RIDGE)
+        # On the drop: between "anchored on the old high" (-1) and "anchored on hour 1" (0).
+        # On the size: a bigger hour 1 leaves less room to grow, never more.
+        slope = max(-1.0 if SLOPE_ON == 1 else SLOPE_MIN, min(0.0, slope))
+        lo = min(x for _, _, x in usable)
+        hi = max(x for _, _, x in usable)
+        x_target = max(lo, min(hi + REACH, x_target))  # barely extrapolate past the analogs
+    center = mean + (slope * (x_target - xbar) if slope else 0.0)
+    var = 0.0
+    for w, y, x in pts:
+        fitted = mean + (slope * (x - xbar) if (slope and x is not None) else 0.0)
+        var += w * (y - fitted) ** 2
+    var /= sw
+    return center, var, n_eff
 
 
 def smooth(values):
@@ -199,19 +236,17 @@ def smooth(values):
 
 
 def forecast(case):
-    p1, pool = analogs(case)
+    p1, pool, t_drop = analogs(case)
     centers = []
     spreads = []
     for h in HOURS:
-        pts = [(w, r[h]) for w, r in pool if h in r]
-        sw = sum(w for w, _ in pts)
+        pts = [(w, r[h], x) for w, r, x in pool if h in r]
+        sw = sum(w for w, _, _ in pts)
         if not pts or sw <= 0:
             centers.append(0.0)
             spreads.append(0.15 * math.sqrt(h - 1))
             continue
-        mean = sum(w * y for w, y in pts) / sw
-        var = sum(w * (y - mean) ** 2 for w, y in pts) / sw
-        n_eff = sw * sw / sum(w * w for w, _ in pts)
+        mean, var, n_eff = fit_hour(pts, t_drop)
         # Small-sample widening: the mean itself is uncertain, and the variance is biased low.
         if n_eff > 1.5:
             var = var * n_eff / (n_eff - 1.0) * (1.0 + 1.0 / n_eff)
