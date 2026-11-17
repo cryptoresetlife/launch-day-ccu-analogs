@@ -41,7 +41,10 @@ RIDGE = 0.5       # damping of that slope
 SLOPE_MIN = -0.5  # steepest size slope allowed (log ratio per log viewer)
 REACH = 0.0       # how far past the largest analog the size may be extrapolated (log units)
 BACKGROUND = 0.03  # share of weight every usable comparable keeps regardless of distance
-SPREAD_SCALE = 0.75  # multiplies the analog scatter
+NUDGE_GAIN = 0.8   # how much of hour 1's closing surprise carries into hour 2
+NUDGE_FADE = 2.5   # hours over which it fades
+NUDGE_CAP = 0.25   # largest surprise believed (log units)
+SPREAD_SCALE = 0.66  # multiplies the analog scatter
 SPREAD_FLOOR = 0.07  # least log spread of any hour
 TAIL_STRETCH = 1.1  # extra width of the 5% and 95% quantiles (fat tails)
 
@@ -255,6 +258,9 @@ def forecast(case):
         centers.append(mean)
         spreads.append(math.sqrt(var))
     spreads = smooth(spreads)
+    nudge = late_hour_nudge(case, p1, centers[0])
+    for i, h in enumerate(HOURS):
+        centers[i] += NUDGE_GAIN * nudge * math.exp(-(h - 2) / NUDGE_FADE)
     rows = []
     for i, h in enumerate(HOURS):
         s = max(SPREAD_FLOOR, SPREAD_SCALE * spreads[i])
@@ -264,6 +270,37 @@ def forecast(case):
             qs.append(p1 * math.exp(centers[i] + zz * s))
         rows.append({"hour": h, "q": tidy(qs)})
     return {"hours": rows}
+
+
+def late_hour_nudge(case, p1, center2):
+    """Where hour 1 ended, against where the analogs say it should have ended (log units).
+
+    Only the final has minute reads.  The mean of hour 1's last ten minutes sits about 0.42 of
+    the way from hour 1's middle to hour 2's, so a steady drift towards the forecast hour-2
+    center would put it at 0.42 x center2; what is left over is news about the next hours,
+    which fades quickly.  0 when the history has no minute reads of hour 1."""
+    try:
+        t0 = parse_time(case["day_start"])
+        t1 = parse_time(case["checkpoint"]) if case.get("checkpoint") else t0 + 3600.0
+        reads = []
+        for row in case.get("history") or []:
+            v = row.get("viewers")
+            if v is None or v <= 0:
+                continue
+            t = parse_time(row["at"])
+            if t0 <= t < t1:
+                reads.append((t, float(v)))
+        if len(reads) < 30:
+            return 0.0
+        reads.sort()
+        tail = [v for t, v in reads if t >= t1 - 600.0]
+        if len(tail) < 5:
+            return 0.0
+        last = sum(tail) / len(tail)
+        news = math.log(last / p1) - 0.42 * center2
+        return max(-NUDGE_CAP, min(NUDGE_CAP, news))
+    except Exception:
+        return 0.0
 
 
 def tidy(qs):
